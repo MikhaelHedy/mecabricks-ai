@@ -1,6 +1,5 @@
 // src/App.jsx
 import React, { useState, useEffect } from 'react';
-import useLegoStore from './store/useLegoStore';
 import UploadBox from './components/UploadBox';
 import BrickTable from './components/BrickTable';
 import LegoViewer from './components/LegoViewer';
@@ -8,102 +7,72 @@ import { parseDAE } from './parser/daeParser';
 import { groupBricks } from './engine/groupingEngine';
 import { exportCSV } from './utils/exportCSV';
 
-function App() {
-  const { daeText, bricks, groupedBricks, isLoading, error, setDaeText, setBricks, setGroupedBricks, setLoading, setError, reset } = useLegoStore();
+export default function App() {
+  const [daeText, setDaeText] = useState("");
+  const [bricks, setBricks] = useState([]);
+  const [grouped, setGrouped] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null); // State for error handling
 
   useEffect(() => {
-    const handleFileUploaded = (event) => {
-      reset(); // Reset state sebelumnya
-      setDaeText(event.detail);
+    const handleUpload = (e) => {
+      setLoading(true);
+      setError(null); // Clear previous errors
+      setDaeText(e.detail);
     };
-
-    window.addEventListener('daeFileUploaded', handleFileUploaded);
-    return () => {
-      window.removeEventListener('daeFileUploaded', handleFileUploaded);
-    };
-  }, [setDaeText, reset]);
+    window.addEventListener('daeFileUploaded', handleUpload);
+    return () => window.removeEventListener('daeFileUploaded', handleUpload);
+  }, []);
 
   useEffect(() => {
     if (daeText) {
-      setLoading(true);
-      setError(null);
       try {
-        const parsedBricks = parseDAE(daeText);
-        setBricks(parsedBricks); // Simpan semua brick individual untuk viewer
-        
-        const grouped = groupBricks(parsedBricks);
-        setGroupedBricks(grouped);
+        const parsed = parseDAE(daeText);
+        setBricks(parsed);
+        setGrouped(groupBricks(parsed));
       } catch (err) {
-        console.error("Error processing DAE file:", err);
-        setError("Gagal memproses file DAE. Pastikan formatnya valid. " + err.message);
-        setBricks([]);
-        setGroupedBricks({});
+        console.error("Error parsing DAE file:", err);
+        setError("Gagal mengurai file DAE: " + err.message + ". Pastikan ini adalah file COLLADA (.dae) yang valid dari Mecabricks.");
+        setBricks([]); // Clear previous bricks on error
+        setGrouped({}); // Clear previous grouped data on error
       } finally {
         setLoading(false);
       }
     }
-  }, [daeText, setBricks, setGroupedBricks, setLoading, setError]);
-
-  const handleExport = () => {
-    if (Object.keys(groupedBricks).length > 0) {
-      exportCSV(groupedBricks);
-    } else {
-      alert("Tidak ada data untuk diekspor!");
-    }
-  };
+  }, [daeText]);
 
   return (
-    <div className="min-h-screen bg-gray-100 p-8 font-sans"> {/* Added font-sans for better typography */}
-      <div className="max-w-4xl mx-auto bg-white p-8 rounded-lg shadow-xl">
-        <h1 className="text-4xl font-extrabold text-gray-900 mb-6 text-center">
-          Mecabricks Lego Layer Counter
-        </h1>
-        <p className="text-gray-600 text-center mb-8">
-          Unggah file `.dae` Anda dari Mecabricks untuk menganalisis jumlah LEGO per layer.
-        </p>
-
+    <div className="min-h-screen bg-gray-100 p-8 font-sans">
+      <div className="max-w-4xl mx-auto bg-white p-8 rounded-xl shadow-2xl">
+        <h1 className="text-4xl font-black text-center text-gray-900 mb-2">LEGO Layer Analyzer</h1>
+        <p className="text-center text-gray-500 mb-8">Mecabricks DAE File Processor</p>
+        
         <UploadBox />
 
-        {isLoading && (
-          <div className="flex items-center justify-center py-8">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
-            <p className="ml-4 text-blue-600 text-lg">Memproses file Anda...</p>
-          </div>
-        )}
-
+        {loading && <div className="text-center py-10 text-blue-600 font-semibold">Memproses file... Ini mungkin memakan waktu untuk file besar.</div>}
+        
         {error && (
-          <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mt-6" role="alert">
+          <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mt-4" role="alert">
             <strong className="font-bold">Error!</strong>
-            <span className="block sm:inline"> {error}</span>
+            <span className="block sm:inline ml-2">{error}</span>
           </div>
         )}
 
-        {!isLoading && !error && Object.keys(groupedBricks).length > 0 && (
+        {!loading && !error && bricks.length > 0 && (
           <div className="mt-8">
-            <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Hasil Analisis</h2>
-            
-            <div className="mb-6 flex justify-end">
-              <button
-                onClick={handleExport}
-                className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-colors duration-200"
+            <LegoViewer allBricks={bricks} />
+            <div className="flex justify-end mt-4">
+              <button 
+                onClick={() => exportCSV(grouped)} 
+                className="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg font-bold shadow-md transition"
               >
-                Export ke CSV
+                Download CSV
               </button>
             </div>
-
-            <BrickTable grouped={groupedBricks} />
-
-            <h2 className="text-3xl font-bold text-gray-800 mt-12 mb-6 text-center">Visualisasi 3D</h2>
-            <LegoViewer allBricks={bricks} /> {/* Mengirim semua brick individual ke viewer */}
+            <BrickTable grouped={grouped} />
           </div>
-        )}
-
-        {!isLoading && !error && !daeText && (
-            <p className="text-center text-gray-500 mt-8">Silakan unggah file .DAE untuk memulai.</p>
         )}
       </div>
     </div>
   );
 }
-
-export default App;

@@ -1,189 +1,269 @@
 // src/parser/daeParser.js
 import { XMLParser } from "fast-xml-parser";
-import { PLATE_HEIGHT_UNIT_MM, LEGO_UP_AXIS } from '../utils/constants';
+import { 
+  PLATE_HEIGHT_UNIT_MM, 
+  createIdentityMatrix, 
+  multiplyMatrices, 
+  getRobustTranslationFromMatrix,
+  MECABRICKS_GEOMETRY_ID_MAP, 
+  MECABRICKS_EFFECT_ID_MAP    
+} from '../utils/constants';
 
 const parserOptions = {
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
   allowBooleanAttributes: true,
-  parseTagValue: true,
+  parseTagValue: true, 
   parseAttributeValue: true,
-  // Memastikan array untuk elemen-elemen yang bisa muncul berkali-kali
-  arrayPropName: (name) => {
-    if (name === "node" || name === "material" || name === "geometry") return name;
-    return undefined; // Ini agar parser tidak secara otomatis membuat array untuk semua properti
+  
+  // FIX 1 & 2: Ganti `arrayPropName` dengan `isArray` dan HAPUS `stopNodes`
+  isArray: (name, jpath) => {
+    return (
+      name === "node" || // Node sekarang akan selalu di-parse sebagai array (jika ada lebih dari satu atau pun satu)
+      name === "material" ||
+      name === "geometry" ||
+      name === "instance_material" || // Material instances juga harus selalu array
+      jpath.endsWith("library_visual_scenes.visual_scene.node") // Pastikan root nodes juga array
+    );
   },
+  // FIX 1: HAPUS `stopNodes: ["*.node"]` yang menyebabkan seluruh node di-parse sebagai teks mentah.
 };
 
 const parser = new XMLParser(parserOptions);
 
 export function parseDAE(xmlText) {
   const data = parser.parse(xmlText);
+  // --- DEBUG ---
+  console.log("DAE XML parsed data (COLLADA object):", data.COLLADA);
+  // --- END DEBUG ---
 
   if (!data.COLLADA || !data.COLLADA.library_visual_scenes || !data.COLLADA.library_visual_scenes.visual_scene) {
-    throw new Error("Invalid COLLADA DAE file structure. Missing core elements.");
+    throw new Error("Invalid COLLADA DAE file structure: Missing required sections (COLLADA, library_visual_scenes, visual_scene).");
   }
 
   const visualScene = data.COLLADA.library_visual_scenes.visual_scene;
-  
-  // Tangani kasus di mana hanya ada satu node visual_scene, jadi tidak otomatis menjadi array
   let nodes = visualScene.node;
-  if (nodes && !Array.isArray(nodes)) {
-    nodes = [nodes];
-  } else if (!nodes) {
-    nodes = []; // Jika tidak ada node sama sekali
-  }
-  
-  // Parse materials and geometries for lookup
-  const materials = parseMaterials(data.COLLADA.library_materials?.material);
-  const geometries = parseGeometries(data.COLLADA.library_geometries?.geometry);
+  // `isArray` config seharusnya sudah memastikan `nodes` selalu array.
+  if (!nodes) nodes = []; 
+
+  const materialsLookup = parseMaterials(data.COLLADA.library_materials?.material, data.COLLADA.library_effects?.effect);
+  const geometriesLookup = parseGeometries(data.COLLADA.library_geometries?.geometry);
+
+  // --- DEBUG ---
+  console.log("Geometries Lookup Map:", geometriesLookup);
+  console.log("Materials Lookup Map:", materialsLookup);
+  // --- END DEBUG ---
 
   const parsedBricks = [];
+  const identityMatrix = createIdentityMatrix();
+
   for (const node of nodes) {
-    // Memproses node yang mungkin bertingkat
-    processNode(node, { materials, geometries }, parsedBricks);
+    processNode(node, { materialsLookup, geometriesLookup }, parsedBricks, identityMatrix);
   }
 
-  return parsedBricks.filter(brick => brick !== null); // Filter out any nulls if node wasn't a brick
+  // --- DEBUG ---
+  console.log("Final parsed bricks array:", parsedBricks);
+  // --- END DEBUG ---
+
+  return parsedBricks;
 }
 
-// Helper untuk memproses node dan sub-node secara rekursif
-function processNode(node, context, results) {
-  // Check if this node is an actual brick instance
+function processNode(node, context, results, parentAccumulatedMatrix) {
+  // --- DEBUG ---
+  // console.log("Processing node:", node['@_id'] || node['@_name'] || "anonymous_node");
+  // --- END DEBUG ---
+
+  let localMatrix = createIdentityMatrix();
+  let matrixValue = null;
+
+  if (node.matrix) {
+      if (typeof node.matrix === "string") {
+          matrixValue = node.matrix;
+      } else if (typeof node.matrix === "object" && node.matrix !== null) {
+          matrixValue = node.matrix["#text"] || node.matrix["__text"] || "";
+      }
+  }
+
+  const localMatrixValues = matrixValue?.trim().split(/\s+/).map(Number).filter(v => !isNaN(v));
+  if (localMatrixValues && localMatrixValues.length === 16) {
+    localMatrix = localMatrixValues;
+  }
+
+  const currentAccumulatedMatrix = multiplyMatrices(parentAccumulatedMatrix, localMatrix);
+
   if (node.instance_geometry) {
-    const brick = parseBrick(node, context);
-    if (brick) {
-      results.push(brick);
+    // FIX 3: Pastikan instance_geometry selalu diperlakukan sebagai array
+    const instanceGeometries = Array.isArray(node.instance_geometry)
+      ? node.instance_geometry
+      : [node.instance_geometry]; // Jika bukan array, buat menjadi array berisi satu elemen
+      
+    for (const instGeom of instanceGeometries) {
+        const brick = parseBrick(node, instGeom, context, currentAccumulatedMatrix);
+        if (brick) results.push(brick);
     }
   }
 
-  // Handle nested nodes (groups, complex parts, etc.)
-  // Pastikan node.node adalah array atau ubah menjadi array jika hanya satu
   if (node.node) {
-    let subNodes = Array.isArray(node.node) ? node.node : [node.node];
-    for (const subNode of subNodes) {
-      processNode(subNode, context, results);
+    // `isArray` config seharusnya sudah memastikan `node.node` selalu array.
+    for (const subNode of node.node) {
+      processNode(subNode, context, results, currentAccumulatedMatrix);
     }
   }
 }
 
-function parseMaterials(materialData) {
-  const materials = {};
-  if (!materialData) return materials;
+function parseMaterials(materialData, effectData) {
+  const materialsMap = {}; 
+  const effectsMap = {}; 
 
-  let materialArray = Array.isArray(materialData) ? materialData : [materialData];
+  if (effectData) {
+    let effectArray = Array.isArray(effectData) ? effectData : [effectData];
+    for (const eff of effectArray) {
+      const effectId = eff['@_id'];
+      if (!effectId) continue;
 
-  for (const mat of materialArray) {
-    const id = mat['@_id'];
-    const effectUrl = mat.instance_effect?.['@_url'];
-    if (id && effectUrl) {
-      // ID material di Mecabricks seringkali seperti "MB|141-material"
-      // Kita hanya mengambil bagian numerik atau nama dari effect yang direferensikan
-      // dan membuang #MB| dan -effect
-      const effectId = effectUrl.replace('#', ''); // Hapus #
-      materials[id] = effectId.replace('MB|', '').replace('-effect', ''); // Ambil ID warna
+      let resolvedColorCode = null;
+      // Ensure effectId is string before using .match()
+      const colorMatch = String(effectId).match(/MB\|(\d+)-effect/); 
+      if (colorMatch) {
+        resolvedColorCode = colorMatch[1];
+      } 
+      else if (MECABRICKS_EFFECT_ID_MAP[effectId]) { 
+        resolvedColorCode = MECABRICKS_EFFECT_ID_MAP[effectId];
+      }
+      
+      if (resolvedColorCode) {
+        effectsMap[effectId] = resolvedColorCode;
+      } else {
+        // --- DEBUG ---
+        console.warn(`[parseMaterials] Could not resolve color code for effect ID: ${effectId}.`);
+        // --- END DEBUG ---
+      }
     }
   }
-  return materials;
+
+  if (materialData) {
+    let materialArray = Array.isArray(materialData) ? materialData : [materialData];
+    for (const mat of materialArray) {
+      const id = mat['@_id'];
+      const instanceEffect = mat.instance_effect;
+      const effectUrl = instanceEffect?.['@_url'];
+      
+      if (id && effectUrl) {
+        const effectId = effectUrl.replace('#', '');
+        if (effectsMap[effectId]) {
+          materialsMap[id] = effectsMap[effectId]; 
+        } else {
+          // --- DEBUG ---
+          console.warn(`[parseMaterials] No resolved effect found for material ID: ${id} (effect URL: ${effectUrl}). Skipping material mapping.`);
+          // --- END DEBUG ---
+        }
+      } else {
+        // --- DEBUG ---
+        console.warn(`[parseMaterials] Missing ID or instance_effect for material data:`, mat);
+        // --- END DEBUG ---
+      }
+    }
+  }
+  return materialsMap;
 }
 
 function parseGeometries(geometryData) {
-  const geometries = {};
-  if (!geometryData) return geometries;
-
+  const geometriesMap = {}; 
+  if (!geometryData) return geometriesMap;
   let geometryArray = Array.isArray(geometryData) ? geometryData : [geometryData];
 
   for (const geom of geometryArray) {
-    const id = geom['@_id']; // e.g., "3001-mesh"
-    const name = geom['@_name']; // e.g., "3001"
-    if (id && name) {
-      geometries[id] = name; // Map geometry ID (e.g., "3001-mesh") to its descriptive name (e.g., "3001")
+    const id = geom['@_id'];   
+    const name = geom['@_name']; 
+
+    if (!id) {
+        // --- DEBUG ---
+        console.warn(`[parseGeometries] Geometry element missing ID:`, geom);
+        // --- END DEBUG ---
+        continue;
+    }
+
+    let resolvedPartId = null;
+
+    // 1. Try to extract from geometry 'name' attribute
+    if (name !== undefined && name !== null) {
+        const nameAsString = String(name);
+        const nameMatch = nameAsString.match(/(\d+)(?:-\d+)?(?:\.json)?/); 
+        if (nameMatch) {
+            resolvedPartId = nameMatch[1];
+        }
+    }
+    
+    // 2. Fallback: Try to extract from geometry 'id' attribute
+    if (!resolvedPartId && id !== undefined && id !== null) {
+        const idAsString = String(id);
+        const idMatch = idAsString.match(/geom_(\d+)(?:-\d+)?/); 
+        if (idMatch) {
+            resolvedPartId = idMatch[1];
+        }
+    }
+
+    // 3. Fallback: Use custom map for known descriptive IDs
+    if (!resolvedPartId && MECABRICKS_GEOMETRY_ID_MAP[id]) {
+      resolvedPartId = MECABRICKS_GEOMETRY_ID_MAP[id];
+    }
+    
+    if (resolvedPartId) {
+      geometriesMap[id] = resolvedPartId;
+    } else {
+      // --- DEBUG ---
+      console.warn(`[parseGeometries] Could not resolve part ID for geometry ID: ${id} (name: ${name}).`);
+      // --- END DEBUG ---
     }
   }
-  return geometries;
+  return geometriesMap;
 }
 
-function parseBrick(node, context) {
-  const { materials, geometries } = context;
-
-  const instanceGeometry = node.instance_geometry;
-  if (!instanceGeometry) {
-    return null; // Node ini bukan instance geometri brick
+function parseBrick(node, instanceGeometry, context, accumulatedMatrix) {
+  const { materialsLookup, geometriesLookup } = context;
+  
+  const geometryUrl = instanceGeometry['@_url'];
+  if (!geometryUrl) {
+    // --- DEBUG ---
+    console.warn(`[parseBrick] instance_geometry missing URL:`, instanceGeometry);
+    // --- END DEBUG ---
+    return null;
   }
 
-  const geometryUrl = instanceGeometry['@_url']; // e.g., "#3001-mesh"
-  const materialUrl = instanceGeometry.bind_material?.technique_common?.instance_material?.['@_target']; // e.g., "#MB|141-material"
+  const rawGeometryId = geometryUrl.replace("#", ""); 
+  const rawBrickId = geometriesLookup[rawGeometryId];
 
-  const rawGeometryId = geometryUrl?.replace("#", ""); // e.g., "3001-mesh"
-  const rawBrickId = geometries[rawGeometryId] || rawGeometryId.replace("-mesh", ""); // e.g., "3001"
+  // --- DEBUG ---
+  // console.log(`[parseBrick] Processing geometry ID: ${rawGeometryId}, Resolved Part ID: ${rawBrickId}`);
+  // --- END DEBUG ---
+
+  if (!rawBrickId) {
+    console.warn(`[parseBrick] Part ID not found in lookup for geometry ID: ${rawGeometryId}. Skipping brick.`);
+    return null;
+  }
+
+  let instanceMaterial = instanceGeometry.bind_material?.technique_common?.instance_material;
+  // `isArray` config seharusnya sudah memastikan `instance_material` selalu array, ambil elemen pertama
+  if (Array.isArray(instanceMaterial)) instanceMaterial = instanceMaterial[0];
+  const materialUrl = instanceMaterial?.['@_target'];
+
+  const rawMaterialId = materialUrl?.replace("#", ""); 
+  let rawColorCode = materialsLookup[rawMaterialId]; // Biarkan `let` karena akan diubah
+
+  // --- DEBUG ---
+  // console.log(`[parseBrick] Processing material ID: ${rawMaterialId}, Resolved Color Code: ${rawColorCode}`);
+  // --- END DEBUG ---
+
+  // FIX 7: Jangan discard brick jika warna tidak ditemukan, gunakan warna default
+  if (!rawColorCode) {
+    console.warn(`[parseBrick] Color code not found in lookup for material ID: ${rawMaterialId}. Using default color 'Medium Stone Grey (Light Bluish Gray)' (code 194).`);
+    rawColorCode = "194"; // Default ke Medium Stone Grey (kode 194)
+  }
+
+  const { x, y, z } = getRobustTranslationFromMatrix(accumulatedMatrix);
   
-  const rawMaterialId = materialUrl?.replace("#", ""); // e.g., "MB|141-material"
-  const rawColorCode = materials[rawMaterialId] || rawMaterialId.replace("MB|", "").replace("-material", ""); // e.g., "141"
+  // FIX 4: Tambahkan rounding untuk presisi tinggi layer
+  const layerHeightUnit = Math.round((z / PLATE_HEIGHT_UNIT_MM) * 1000) / 1000; // Round ke 3 desimal
 
-  // Extract transformation matrix
-  
-let matrixText = "";
-
-if (typeof node.matrix === "string") {
-  matrixText = node.matrix;
-}
-else if (typeof node.matrix === "object") {
-
-  matrixText =
-    node.matrix["#text"] ||
-    node.matrix["__text"] ||
-    "";
-}
-
-const matrixValues =
-  matrixText
-    .trim()
-    .split(/\s+/)
-    .map(Number);
-
-if (
-  !matrixText ||
-  !matrixValues ||
-  matrixValues.length !== 16
-) {
-
-  console.warn(
-    "Skipping node due to invalid matrix:",
-    node
-  );
-
-  return null;
-}
-  // COLLADA matrix is column-major. Translation is typically in elements m12, m13, m14 (indices 12, 13, 14).
-  // However, your sample DAE and common Mecabricks exports often seem to use elements m3, m7, m11 (indices 3, 7, 11)
-  // for the translation vector, assuming a row-major interpretation or a different internal mapping.
-  // We'll stick to the observed pattern from your DAE sample:
-  const x = matrixValues[3];
-  const y = matrixValues[7]; // Ini adalah komponen Y untuk posisi (tinggi)
-  const z = matrixValues[11];
-  
-  // Konversi dari milimeter (unit DAE) ke unit 'plate height'
-  const layerHeightUnit = y / PLATE_HEIGHT_UNIT_MM;
-  
-  // Round to nearest whole number for integer layer index.
-  // This effectively groups bricks that are slightly above or below the exact plate height
-  // into the same conceptual layer.
-  const layerIndex = Math.round(layerHeightUnit);
-  console.log({
-  rawBrickId,
-  rawColorCode,
-  x,
-  y,
-  z,
-  layerIndex
-});
-  return {
-    rawBrickId,       // ID geometri mentah (e.g., "3001")
-    rawColorCode,     // Kode warna mentah dari material (e.g., "141")
-    x,                // Koordinat X (mm)
-    y,                // Koordinat Y (mm) - Ini adalah tinggi!
-    z,                // Koordinat Z (mm)
-    layerHeightUnit,  // Tinggi dalam unit plate (bisa float)
-    layerIndex,       // Indeks layer (integer)
-  };
+  return { rawBrickId, rawColorCode, x, y, z, layerHeightUnit };
 }

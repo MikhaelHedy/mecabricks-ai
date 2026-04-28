@@ -1,43 +1,61 @@
 // src/engine/groupingEngine.js
-import { LEGO_PART_NAMES, LEGO_COLOR_NAMES } from '../utils/constants';
+import { LEGO_PART_NAMES, LEGO_COLOR_NAMES, LAYER_GROUPING_TOLERANCE } from '../utils/constants';
 
 export function groupBricks(bricks) {
-  const grouped = {};
-
+  const groupedLayers = [];
   const validBricks = bricks.filter(brick => brick !== null);
 
   for (const brick of validBricks) {
-    // Gunakan layerIndex untuk grouping utama
-    const currentLayerIndex = brick.layerIndex;
-    if (!grouped[currentLayerIndex]) {
-      grouped[currentLayerIndex] = {};
+    const currentLayerHeight = brick.layerHeightUnit;
+    let foundLayer = false;
+
+    for (const layer of groupedLayers) {
+      if (Math.abs(layer.layerBaseY - currentLayerHeight) < LAYER_GROUPING_TOLERANCE) {
+        const partName = LEGO_PART_NAMES[brick.rawBrickId] || `Part ${brick.rawBrickId}`;
+        const colorName = LEGO_COLOR_NAMES[brick.rawColorCode] || `Color ${brick.rawColorCode}`;
+        const key = `${partName} (${colorName})`;
+
+        if (!layer.items[key]) {
+          layer.items[key] = {
+            count: 0,
+            partId: brick.rawBrickId,
+            colorCode: brick.rawColorCode,
+            positions: [], 
+          };
+        }
+        layer.items[key].count++;
+        layer.items[key].positions.push({ x: brick.x, y: brick.y, z: brick.z });
+        foundLayer = true;
+        break;
+      }
     }
 
-    // Dapatkan nama part dan nama warna yang lebih mudah dibaca
-    const partName = LEGO_PART_NAMES[brick.rawBrickId] || `Part ${brick.rawBrickId}`;
-    const colorName = LEGO_COLOR_NAMES[brick.rawColorCode] || `Color ${brick.rawColorCode}`;
-    
-    const key = `${partName} (${colorName})`;
+    if (!foundLayer) {
+      const partName = LEGO_PART_NAMES[brick.rawBrickId] || `Part ${brick.rawBrickId}`;
+      const colorName = LEGO_COLOR_NAMES[brick.rawColorCode] || `Color ${brick.rawColorCode}`;
+      const key = `${partName} (${colorName})`;
 
-    if (!grouped[currentLayerIndex][key]) {
-      grouped[currentLayerIndex][key] = {
-        count: 0,
-        partId: brick.rawBrickId,
-        colorCode: brick.rawColorCode,
-        positions: [], // Simpan posisi individual untuk 3D rendering
+      const newLayer = {
+        layerBaseY: parseFloat(currentLayerHeight.toFixed(3)),
+        items: {
+          [key]: {
+            count: 1,
+            partId: brick.rawBrickId,
+            colorCode: brick.rawColorCode,
+            positions: [{ x: brick.x, y: brick.y, z: brick.z }],
+          },
+        },
       };
+      groupedLayers.push(newLayer);
     }
-
-    grouped[currentLayerIndex][key].count++;
-    grouped[currentLayerIndex][key].positions.push({ x: brick.x, y: brick.y, z: brick.z });
   }
 
-  // Urutkan layer secara ascending (dari bawah ke atas)
-  const sortedLayerKeys = Object.keys(grouped).sort((a, b) => parseInt(a) - parseInt(b));
-  const sortedGrouped = {};
-  for (const layerKey of sortedLayerKeys) {
-    sortedGrouped[layerKey] = grouped[layerKey];
-  }
+  groupedLayers.sort((a, b) => a.layerBaseY - b.layerBaseY);
 
-  return sortedGrouped;
+  const finalGroupedOutput = {};
+  groupedLayers.forEach((layer, index) => {
+    finalGroupedOutput[index] = layer;
+  });
+
+  return finalGroupedOutput;
 }
